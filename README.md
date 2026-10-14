@@ -20,12 +20,12 @@ Requires Python 3.11 (see `.python-version`): `gym==0.26.2` and `ale-py==0.8.1` 
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-python train.py --max-steps 120000                 # about 15 minutes on a 16-core CPU
+python train.py --max-steps 120000                 # about 7 minutes on a 16-thread CPU
 python train.py --model models/<saved>.keras       # resume from a checkpoint
 python train.py --evaluate models/<saved>.keras    # average score of a saved model
 ```
 
-Checkpoints are written to `models/` (or `--save-dir`) every 20 episodes and at the end. They are git-ignored.
+Checkpoints are written to `models/` (or `--save-dir`) every 100,000 steps and at the end. They are git-ignored.
 
 ## What the script does
 
@@ -49,6 +49,28 @@ Trained for 120,000 steps (1,677 episodes) on CPU, then evaluated over 30 episod
 The training curve rose from about 2 to about 7 over the run and was still trending up when it stopped, so longer
 runs should do better. The first version of this script (no input scaling, epsilon decaying to its floor within
 a few hundred steps, no warm-up, no FIRE handling) did not learn: its score fell from about 2.4 to 0 in 58 episodes.
+
+## Training speed
+
+Measured on an AMD Ryzen 7 7435HS (8 cores / 16 threads), CPU only, TensorFlow 2.19, training updates active:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/speedup_dark.png">
+  <img alt="Bar chart of training throughput: 150 steps per second for the original loop, rising to 316 with 8 parallel games and 337 with 16" src="docs/speedup_light.png">
+</picture>
+
+Two changes account for the **2.1x speedup** (150 to 316 steps/s with 8 games; `python benchmark.py` reproduces the table):
+
+1. **Compiled move selection.** Choosing a move used to cost 7.3 ms per frame, almost all of it Keras call overhead for a
+   batch of one. Wrapping the network call in `tf.function` brings it to 0.4 ms.
+2. **Parallel games.** `--num-envs N` runs N games in separate processes and sends their frames through the network
+   as one batch. The exploration schedule, warm-up, update frequency and target sync are all counted in environment
+   steps summed over the games, so they mean the same thing for any N.
+
+Moving the game into its own process costs some time on its own (the 112 steps/s row), which compilation and
+batching more than win back. Beyond about 8 games the gains flatten: the training update (about 9 ms per batch of 32,
+mostly convolutions on the CPU) is now the bottleneck, and compiling it with XLA only saves 8%. A working GPU would
+help there, but not for the per-step work above.
 
 ## Notebook status
 
