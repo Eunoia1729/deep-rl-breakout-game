@@ -13,6 +13,7 @@ from tensorflow import keras
 from tensorflow.keras.layers import Conv2D, Flatten, Dense, Rescaling
 import argparse
 import datetime
+import multiprocessing as mp
 import os
 import random
 
@@ -102,8 +103,10 @@ class ReplayMemory:
 
 
 class DeepQNetwork:
-    def __init__(self, learning_rate=0.0001, input_shape=(84, 84, 4), output_size=4):
+    def __init__(self, learning_rate=0.0001, input_shape=(84, 84, 4), output_size=4, compile_inference=True):
         self.model = self.makeModel(input_shape, output_size)
+        self.compile_inference = compile_inference
+        self._reset_compiled()
         self.output_size = output_size
         self.optimizer = keras.optimizers.Adam(learning_rate)
         self.loss_fn = keras.losses.Huber()
@@ -119,9 +122,22 @@ class DeepQNetwork:
         model.add(Dense(output_size))
         return model
 
+    def _q_values(self, x):
+        return self.model(x, training=False)
+
+    def _reset_compiled(self):
+        # tf.function captures the model's variables, so rebuild it whenever the model is replaced
+        self._forward = tf.function(self._q_values, reduce_retracing=True)
+
     def predict(self, states):
-        """Q-values for a batch of states. Calling the model directly is much faster than .predict()."""
-        return self.model(np.asarray(states, dtype=np.float32), training=False).numpy()
+        """Q-values for a batch of states.
+
+        Calling the model directly is much faster than Keras .predict(); wrapping it in tf.function removes
+        most of the remaining per-call Python overhead, which dominates for tiny batches.
+        """
+        x = np.asarray(states, dtype=np.float32)
+        out = self._forward(x) if self.compile_inference else self.model(x, training=False)
+        return out.numpy()
 
     def getModel(self):
         return self.model
@@ -130,6 +146,7 @@ class DeepQNetwork:
         if path is None:
             raise ValueError("No path is passed to loadModel call")
         self.model = keras.models.load_model(path)
+        self._reset_compiled()
 
     def setWeights(self, weights):
         self.model.set_weights(weights)
@@ -157,99 +174,179 @@ class DeepQNetwork:
 
 
 FIRE = 1  # ALE Breakout actions: NOOP, FIRE, RIGHT, LEFT
+N_ACTIONS = 4
 
 
-def make_env():
+class AutoFire(gym.Wrapper):
+    """Presses FIRE at the start of the game and after every lost life, whatever the agent chose.
+
+    The ball is only launched by FIRE, so without this a greedy agent can stand still forever. The action that
+    was actually executed is returned in info['action'] so it can be stored in the replay buffer.
+    """
+
+    def __init__(self, env):
+        gym.Wrapper.__init__(self, env)
+        self.need_fire, self.lives = True, None
+
+    def reset(self):
+        self.need_fire, self.lives = True, None
+        return self.env.reset()
+
+    def step(self, action):
+        if self.need_fire:
+            action, self.need_fire = FIRE, False
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        lives = info.get('lives')
+        if self.lives is not None and lives is not None and lives < self.lives:
+            self.need_fire = True
+        self.lives = lives
+        info['action'] = action
+        return obs, reward, terminated, truncated, info
+
+
+def make_env(auto_fire=False):
     env = gym.make("ALE/Breakout-v5", render_mode=None)
     env = MaxAndSkipEnv(env, skip=4)
     env = PreprocessFrame(env)
-    return FrameStack(env, k=4)
+    env = FrameStack(env, k=4)
+    return AutoFire(env) if auto_fire else env
 
 
-def train_model(num_episodes=1000, model_path=None, save_dir='models', max_steps=None,
+def _worker(conn):
+    """Run one game in its own process and answer 'reset' / 'step' / 'close' commands."""
+    env = make_env(auto_fire=True)
+    try:
+        while True:
+            command, data = conn.recv()
+            if command == 'reset':
+                conn.send(env.reset())
+            elif command == 'step':
+                obs, reward, terminated, truncated, info = env.step(data)
+                # restart finished games here, so the learner just keeps stepping
+                reset_obs = env.reset() if (terminated or truncated) else None
+                conn.send((obs, reward, terminated, truncated, info['action'], reset_obs))
+            else:
+                break
+    finally:
+        env.close()
+        conn.close()
+
+
+class ParallelEnvs:
+    """Several Breakout games, each in its own process, so the emulators run on separate CPU cores."""
+
+    def __init__(self, num_envs):
+        ctx = mp.get_context('spawn')  # fork is unsafe once TensorFlow has started threads
+        self.pipes, self.procs = [], []
+        for _ in range(num_envs):
+            parent, child = ctx.Pipe()
+            proc = ctx.Process(target=_worker, args=(child,), daemon=True)
+            proc.start()
+            child.close()
+            self.pipes.append(parent)
+            self.procs.append(proc)
+
+    def reset(self):
+        for pipe in self.pipes:
+            pipe.send(('reset', None))
+        return [pipe.recv() for pipe in self.pipes]
+
+    def step(self, actions):
+        for pipe, action in zip(self.pipes, actions):
+            pipe.send(('step', int(action)))
+        return [pipe.recv() for pipe in self.pipes]
+
+    def close(self):
+        for pipe in self.pipes:
+            try:
+                pipe.send(('close', None))
+            except (BrokenPipeError, OSError):
+                pass
+        for proc in self.procs:
+            proc.join(timeout=5)
+
+
+def train_model(num_episodes=100000, model_path=None, save_dir='models', max_steps=None,
                 gamma=0.99, learning_rate=0.0001, minibatch_size=32, train_frequency=4,
                 warmup_steps=5000, epsilon_decay_steps=50000, min_epsilon=0.1,
-                update_network_frequency=1000, replay_capacity=50000, save_interval=20):
+                update_network_frequency=1000, replay_capacity=50000,
+                start_step=0, checkpoint_steps=None, num_envs=8, compile_inference=True, progress_callback=None):
+    """Train with `num_envs` games played in parallel.
+
+    Everything is counted in environment steps, summed over all games, so the exploration schedule, warm-up,
+    one update per `train_frequency` steps and the target-network sync behave the same for any `num_envs`.
+    """
     replay_memory = ReplayMemory(replay_capacity)
-    online_dqn = DeepQNetwork(learning_rate=learning_rate)
-    target_dqn = DeepQNetwork()
+    online_dqn = DeepQNetwork(learning_rate=learning_rate, compile_inference=compile_inference)
+    target_dqn = DeepQNetwork(compile_inference=compile_inference)
     if model_path is not None:
         online_dqn.loadModel(model_path)
     target_dqn.setWeights(online_dqn.model.get_weights())
 
-    env = make_env()
-    global_steps = 0
+    envs = ParallelEnvs(num_envs)
+    states = envs.reset()  # a list: consecutive transitions share the same array object, which saves memory
+    rewards_so_far = [0.0] * num_envs
+    steps_so_far = [0] * num_envs
+    global_steps, episodes = start_step, 0
+    done_training = False
 
-    for episode in range(1, num_episodes + 1):
-        cur_state = env.reset()
-        done = False
-        total_reward = 0
-        step_no = 0
-        lives = None
-        need_fire = True  # the ball must be launched with FIRE at the start and after each lost life
-
-        while not done:
-            step_no += 1
-            global_steps += 1
+    try:
+        while not done_training and episodes < num_episodes:
             epsilon = max(min_epsilon, 1.0 - (1.0 - min_epsilon) * global_steps / epsilon_decay_steps)
+            greedy = np.argmax(online_dqn.predict(np.stack(states)), axis=1)
+            random_moves = np.random.randint(N_ACTIONS, size=num_envs)
+            actions = np.where(np.random.rand(num_envs) < epsilon, random_moves, greedy)
 
-            if need_fire:
-                action = FIRE
-                need_fire = False
-            elif np.random.rand() < epsilon:
-                action = env.action_space.sample()
-            else:
-                action = int(np.argmax(online_dqn.predict(cur_state[None])[0]))
+            for i, (next_state, reward, terminated, truncated, action, reset_obs) in enumerate(envs.step(actions)):
+                global_steps += 1
+                rewards_so_far[i] += reward
+                steps_so_far[i] += 1
+                # Clip rewards to [-1, 1] so the loss scale does not depend on brick colour.
+                replay_memory.append((states[i], action, np.sign(reward), next_state, terminated))
+                states[i] = next_state
 
-            next_state, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-            total_reward += reward
-            if info.get('lives') is not None:
-                if lives is not None and info['lives'] < lives:
-                    need_fire = True
-                lives = info['lives']
+                if terminated or truncated:
+                    episodes += 1
+                    print(f'Episode: {episodes}. Total steps count: {steps_so_far[i]}, '
+                          f'Total global steps count: {global_steps}, reward count: {rewards_so_far[i]}, '
+                          f'epsilon: {epsilon:.3f}', flush=True)
+                    rewards_so_far[i], steps_so_far[i], states[i] = 0.0, 0, reset_obs
 
-            # Clip rewards to [-1, 1] so the loss scale does not depend on brick colour.
-            replay_memory.append((cur_state, action, np.sign(reward), next_state, terminated))
+                if len(replay_memory) >= max(warmup_steps, minibatch_size) and global_steps % train_frequency == 0:
+                    online_dqn.train(replay_memory.sampleItems(minibatch_size), target_dqn, gamma)
+                if global_steps % update_network_frequency == 0:
+                    target_dqn.setWeights(online_dqn.model.get_weights())
+                if checkpoint_steps and global_steps % checkpoint_steps == 0:
+                    online_dqn.getModel().save(f"{save_dir}/step_{global_steps:09d}.keras")
+                    print(f"Checkpoint saved at step {global_steps}", flush=True)
+                if progress_callback is not None:
+                    progress_callback(global_steps)
+                if max_steps is not None and global_steps >= max_steps:
+                    done_training = True
+                    break
+    finally:
+        envs.close()
 
-            if global_steps > warmup_steps and global_steps % train_frequency == 0:
-                online_dqn.train(replay_memory.sampleItems(minibatch_size), target_dqn, gamma)
-
-            if global_steps % update_network_frequency == 0:
-                target_dqn.setWeights(online_dqn.model.get_weights())
-
-            cur_state = next_state
-            if max_steps is not None and global_steps >= max_steps:
-                break
-
-        print(f'Episode: {episode}. Total steps count: {step_no}, Total global steps count: {global_steps}, '
-              f'reward count: {total_reward}, epsilon: {epsilon:.3f}', flush=True)
-
-        if episode % save_interval == 0 or (max_steps is not None and global_steps >= max_steps):
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            model_filename = f"{save_dir}/breakout_dqn_model_{timestamp}_{episode}.keras"
-            online_dqn.getModel().save(model_filename)
-            print(f"Model saved as {model_filename}", flush=True)
-        if max_steps is not None and global_steps >= max_steps:
-            break
-
-    env.close()
+    online_dqn.getModel().save(f"{save_dir}/step_{global_steps:09d}.keras")
+    print(f"Model saved as {save_dir}/step_{global_steps:09d}.keras", flush=True)
     print('Training completed!')
 
 
-def evaluate(model_path, episodes=10, epsilon=0.05):
-    """Average score of a saved model with a small amount of exploration."""
-    dqn = DeepQNetwork()
-    dqn.loadModel(model_path)
+def evaluate(model_path, episodes=10, epsilon=0.05, max_steps=5000):
+    """Scores of a saved model with a small amount of exploration (model_path=None plays randomly)."""
+    dqn = None
+    if model_path is not None:
+        dqn = DeepQNetwork()
+        dqn.loadModel(model_path)
     env = make_env()
     scores = []
     for _ in range(episodes):
         state, done, total, need_fire, lives, steps = env.reset(), False, 0, True, None, 0
-        while not done and steps < 5000:
+        while not done and steps < max_steps:
             steps += 1
             if need_fire:
                 action, need_fire = FIRE, False
-            elif np.random.rand() < epsilon:
+            elif dqn is None or np.random.rand() < epsilon:
                 action = env.action_space.sample()
             else:
                 action = int(np.argmax(dqn.predict(state[None])[0]))
@@ -271,6 +368,14 @@ def main():
     parser.add_argument("--max-steps", type=int, default=None, help="stop after this many environment steps")
     parser.add_argument("--model", default=None, help="path of a .keras model to resume from")
     parser.add_argument("--save-dir", default="models")
+    parser.add_argument("--num-envs", type=int, default=8, help="games played in parallel (one CPU process each)")
+    parser.add_argument("--checkpoint-steps", type=int, default=100000,
+                        help="also save save-dir/step_<N>.keras every this many environment steps")
+    parser.add_argument("--start-step", type=int, default=0,
+                        help="step count to resume from (with --model), so epsilon continues its schedule")
+    parser.add_argument("--epsilon-steps", type=int, default=50000, help="steps to decay epsilon from 1.0 to 0.1")
+    parser.add_argument("--replay-capacity", type=int, default=50000)
+    parser.add_argument("--target-update", type=int, default=1000, help="steps between target network syncs")
     parser.add_argument("--evaluate", default=None, metavar="MODEL", help="evaluate a saved model and exit")
     parser.add_argument("--eval-episodes", type=int, default=10)
     args = parser.parse_args()
@@ -280,7 +385,10 @@ def main():
         return
     os.makedirs(args.save_dir, exist_ok=True)
     DeepQNetwork().getModel().summary()
-    train_model(args.episodes, args.model, args.save_dir, args.max_steps)
+    train_model(args.episodes, args.model, args.save_dir, args.max_steps,
+                epsilon_decay_steps=args.epsilon_steps, replay_capacity=args.replay_capacity,
+                update_network_frequency=args.target_update, start_step=args.start_step,
+                checkpoint_steps=args.checkpoint_steps, num_envs=args.num_envs)
 
 
 if __name__ == "__main__":
