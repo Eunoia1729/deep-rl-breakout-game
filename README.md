@@ -10,5 +10,3 @@ port the notebook to `gymnasium` and a current `ale-py`.
 
 It also reads and writes models in a Google Drive folder (`/content/drive/My Drive/dqn`); create that folder or
 edit the path in the second cell before running.
-
-A cleaned-up, bug-fixed training script based on this notebook lives in [dqn-breakout](https://github.com/Eunoia1729/dqn-breakout).
