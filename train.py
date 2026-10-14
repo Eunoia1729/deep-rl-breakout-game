@@ -10,10 +10,11 @@ import cv2
 from collections import deque
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras.layers import Conv2D, Flatten, Dense
+from tensorflow.keras.layers import Conv2D, Flatten, Dense, Rescaling
 import argparse
 import datetime
 import os
+import random
 
 cv2.ocl.setUseOpenCL(False)
 
@@ -86,19 +87,18 @@ class FrameStack(gym.Wrapper):
 
 
 class ReplayMemory:
-    def __init__(self, capacity=10000):
+    def __init__(self, capacity=50000):
         self.memory = deque([], maxlen=capacity)
         self.capacity = capacity
 
     def append(self, obj):
         self.memory.append(obj)
 
-    def sampleItems(self, batch_size):
-        random_indices = np.random.choice(len(self.memory), batch_size, replace=True)
-        return [self.memory[i] for i in random_indices]
+    def __len__(self):
+        return len(self.memory)
 
-    def display(self):
-        print(self.memory)
+    def sampleItems(self, batch_size):
+        return random.sample(self.memory, batch_size)
 
 
 class DeepQNetwork:
@@ -106,19 +106,22 @@ class DeepQNetwork:
         self.model = self.makeModel(input_shape, output_size)
         self.output_size = output_size
         self.optimizer = keras.optimizers.Adam(learning_rate)
-        self.loss_fn = tf.keras.losses.MeanAbsoluteError()
+        self.loss_fn = keras.losses.Huber()
 
     def makeModel(self, input_shape, output_size):
         model = keras.Sequential(name='deep_q_network')
-        model.add(Conv2D(16, kernel_size=(8, 8), strides=(4, 4), activation='relu', input_shape=input_shape))
+        model.add(keras.Input(shape=input_shape))
+        model.add(Rescaling(1.0 / 255))  # frames are uint8 in [0, 255]
+        model.add(Conv2D(16, kernel_size=(8, 8), strides=(4, 4), activation='relu'))
         model.add(Conv2D(32, kernel_size=(4, 4), strides=(2, 2), activation='relu'))
         model.add(Flatten())
         model.add(Dense(256, activation='relu'))
         model.add(Dense(output_size))
         return model
 
-    def predict(self, input):
-        return self.model.predict(input)
+    def predict(self, states):
+        """Q-values for a batch of states. Calling the model directly is much faster than .predict()."""
+        return self.model(np.asarray(states, dtype=np.float32), training=False).numpy()
 
     def getModel(self):
         return self.model
@@ -131,53 +134,50 @@ class DeepQNetwork:
     def setWeights(self, weights):
         self.model.set_weights(weights)
 
-    def train(self, batch, target_dqn, gamma):
-        states = tf.stack([b[0] for b in batch])
-        actions = tf.stack([b[1] for b in batch])
-        rewards = tf.stack([b[2] for b in batch])
-        next_states = tf.stack([b[3] for b in batch])
-        dones = tf.cast(tf.stack([b[4] for b in batch]), dtype=tf.float32)
-
-        masks = keras.ops.one_hot(actions, self.output_size)
-        future_q_values = target_dqn.predict(next_states)
-        future_rewards = tf.multiply(tf.reduce_max(future_q_values, axis=1), (1 - dones))
-        future_rewards = tf.subtract(future_rewards, dones)
-        target_values = tf.add(rewards, gamma * future_rewards)
-
-        with tf.GradientTape(persistent=True) as tape:
-            observed_values = keras.ops.sum(keras.ops.multiply(self.model(states), masks), axis=1)
-            loss = self.loss_fn(target_values, observed_values)
-
+    @tf.function
+    def _train_step(self, states, actions, rewards, next_states, dones, target_model, gamma):
+        future_q = tf.reduce_max(target_model(next_states, training=False), axis=1)
+        target_values = rewards + gamma * future_q * (1.0 - dones)
+        masks = tf.one_hot(actions, self.output_size)
+        with tf.GradientTape() as tape:
+            q_values = tf.reduce_sum(self.model(states, training=True) * masks, axis=1)
+            loss = self.loss_fn(target_values, q_values)
         gradients = tape.gradient(loss, self.model.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+        return loss
+
+    def train(self, batch, target_dqn, gamma):
+        states = np.asarray([b[0] for b in batch], dtype=np.float32)
+        actions = np.asarray([b[1] for b in batch], dtype=np.int32)
+        rewards = np.asarray([b[2] for b in batch], dtype=np.float32)
+        next_states = np.asarray([b[3] for b in batch], dtype=np.float32)
+        dones = np.asarray([b[4] for b in batch], dtype=np.float32)
+        return float(self._train_step(states, actions, rewards, next_states, dones,
+                                      target_dqn.model, tf.constant(gamma, tf.float32)))
 
 
-def train_model(num_episodes=1, model_path=None, save_dir='models'):
-    epsilon = 1.0
-    epsilon_decay = 0.995
-    min_epsilon = 0.05
-    gamma = 0.99
-    alpha = 0.00025
-    minibatch_size = 32
-    save_interval = 20
-    min_steps_before_train = 10
-    update_network_frequency = 1000
+FIRE = 1  # ALE Breakout actions: NOOP, FIRE, RIGHT, LEFT
 
-    replay_memory = ReplayMemory()
-    online_dqn = DeepQNetwork(learning_rate=alpha)
+
+def make_env():
+    env = gym.make("ALE/Breakout-v5", render_mode=None)
+    env = MaxAndSkipEnv(env, skip=4)
+    env = PreprocessFrame(env)
+    return FrameStack(env, k=4)
+
+
+def train_model(num_episodes=1000, model_path=None, save_dir='models', max_steps=None,
+                gamma=0.99, learning_rate=0.0001, minibatch_size=32, train_frequency=4,
+                warmup_steps=5000, epsilon_decay_steps=50000, min_epsilon=0.1,
+                update_network_frequency=1000, replay_capacity=50000, save_interval=20):
+    replay_memory = ReplayMemory(replay_capacity)
+    online_dqn = DeepQNetwork(learning_rate=learning_rate)
     target_dqn = DeepQNetwork()
     if model_path is not None:
         online_dqn.loadModel(model_path)
     target_dqn.setWeights(online_dqn.model.get_weights())
 
-    env = gym.make("ALE/Breakout-v5", render_mode=None)
-    # env = gym.make('BreakoutNoFrameskip-v4', render_mode=None)
-    env = MaxAndSkipEnv(env, skip=4)
-    env = PreprocessFrame(env)
-    env = FrameStack(env, k=4)
-
-    episode_rewards = []
-    episode_steps = []
+    env = make_env()
     global_steps = 0
 
     for episode in range(1, num_episodes + 1):
@@ -185,61 +185,102 @@ def train_model(num_episodes=1, model_path=None, save_dir='models'):
         done = False
         total_reward = 0
         step_no = 0
+        lives = None
+        need_fire = True  # the ball must be launched with FIRE at the start and after each lost life
 
         while not done:
             step_no += 1
             global_steps += 1
+            epsilon = max(min_epsilon, 1.0 - (1.0 - min_epsilon) * global_steps / epsilon_decay_steps)
 
-            if global_steps < min_steps_before_train or np.random.rand() < epsilon:
+            if need_fire:
+                action = FIRE
+                need_fire = False
+            elif np.random.rand() < epsilon:
                 action = env.action_space.sample()
             else:
-                action_values = online_dqn.predict(cur_state[None, :, :, :])[0]
-                action = np.argmax(action_values)
+                action = int(np.argmax(online_dqn.predict(cur_state[None])[0]))
 
-            next_state, cur_reward, terminated, truncated, _ = env.step(action)
+            next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
-            total_reward += cur_reward
+            total_reward += reward
+            if info.get('lives') is not None:
+                if lives is not None and info['lives'] < lives:
+                    need_fire = True
+                lives = info['lives']
 
-            replay_memory.append((cur_state, action, cur_reward, next_state, done))
+            # Clip rewards to [-1, 1] so the loss scale does not depend on brick colour.
+            replay_memory.append((cur_state, action, np.sign(reward), next_state, terminated))
 
-            if global_steps > min_steps_before_train and global_steps % minibatch_size == 0:
-                batch = replay_memory.sampleItems(minibatch_size)
-                online_dqn.train(batch, target_dqn, gamma)
-
-            if global_steps > min_steps_before_train:
-                epsilon = max(min_epsilon, epsilon * epsilon_decay)
+            if global_steps > warmup_steps and global_steps % train_frequency == 0:
+                online_dqn.train(replay_memory.sampleItems(minibatch_size), target_dqn, gamma)
 
             if global_steps % update_network_frequency == 0:
                 target_dqn.setWeights(online_dqn.model.get_weights())
 
             cur_state = next_state
+            if max_steps is not None and global_steps >= max_steps:
+                break
 
-        print(f'Episode: {episode}. Total steps count: {step_no}, Total global steps count: {global_steps}, reward count: {total_reward}')
-        episode_rewards.append(total_reward)
-        episode_steps.append(step_no)
+        print(f'Episode: {episode}. Total steps count: {step_no}, Total global steps count: {global_steps}, '
+              f'reward count: {total_reward}, epsilon: {epsilon:.3f}', flush=True)
 
-        if episode % save_interval == 0:
-            print('Saving the model trained so far...')
+        if episode % save_interval == 0 or (max_steps is not None and global_steps >= max_steps):
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             model_filename = f"{save_dir}/breakout_dqn_model_{timestamp}_{episode}.keras"
-            target_dqn.getModel().save(model_filename)
-            print(f"Model saved as {model_filename}")
+            online_dqn.getModel().save(model_filename)
+            print(f"Model saved as {model_filename}", flush=True)
+        if max_steps is not None and global_steps >= max_steps:
+            break
 
     env.close()
     print('Training completed!')
 
 
+def evaluate(model_path, episodes=10, epsilon=0.05):
+    """Average score of a saved model with a small amount of exploration."""
+    dqn = DeepQNetwork()
+    dqn.loadModel(model_path)
+    env = make_env()
+    scores = []
+    for _ in range(episodes):
+        state, done, total, need_fire, lives, steps = env.reset(), False, 0, True, None, 0
+        while not done and steps < 5000:
+            steps += 1
+            if need_fire:
+                action, need_fire = FIRE, False
+            elif np.random.rand() < epsilon:
+                action = env.action_space.sample()
+            else:
+                action = int(np.argmax(dqn.predict(state[None])[0]))
+            state, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            total += reward
+            if lives is not None and info.get('lives', lives) < lives:
+                need_fire = True
+            lives = info.get('lives', lives)
+        scores.append(total)
+    env.close()
+    print(f'Evaluation over {episodes} episodes: mean={np.mean(scores):.2f} max={max(scores):.0f} scores={scores}')
+    return scores
+
 
 def main():
     parser = argparse.ArgumentParser(description="Train a DQN agent on Atari Breakout.")
-    parser.add_argument("--episodes", type=int, default=1000)
+    parser.add_argument("--episodes", type=int, default=100000)
+    parser.add_argument("--max-steps", type=int, default=None, help="stop after this many environment steps")
     parser.add_argument("--model", default=None, help="path of a .keras model to resume from")
     parser.add_argument("--save-dir", default="models")
+    parser.add_argument("--evaluate", default=None, metavar="MODEL", help="evaluate a saved model and exit")
+    parser.add_argument("--eval-episodes", type=int, default=10)
     args = parser.parse_args()
 
+    if args.evaluate:
+        evaluate(args.evaluate, args.eval_episodes)
+        return
     os.makedirs(args.save_dir, exist_ok=True)
     DeepQNetwork().getModel().summary()
-    train_model(args.episodes, args.model, args.save_dir)
+    train_model(args.episodes, args.model, args.save_dir, args.max_steps)
 
 
 if __name__ == "__main__":
