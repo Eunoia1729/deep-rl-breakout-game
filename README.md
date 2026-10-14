@@ -20,11 +20,35 @@ Requires Python 3.11 (see `.python-version`): `gym==0.26.2` and `ale-py==0.8.1` 
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-python train.py --episodes 1000                    # start fresh
+python train.py --max-steps 120000                 # about 15 minutes on a 16-core CPU
 python train.py --model models/<saved>.keras       # resume from a checkpoint
+python train.py --evaluate models/<saved>.keras    # average score of a saved model
 ```
 
-Checkpoints are written to `models/` (or `--save-dir`) every 20 episodes. They are git-ignored.
+Checkpoints are written to `models/` (or `--save-dir`) every 20 episodes and at the end. They are git-ignored.
+
+## What the script does
+
+Standard DQN, with the settings that make Breakout learnable:
+
+- frames are scaled to [0, 1] inside the network (`Rescaling`)
+- epsilon decays linearly from 1.0 to 0.1 over the first 50,000 steps
+- 5,000 warm-up steps before training, one update every 4 steps, replay buffer of 50,000 transitions
+- rewards clipped to [-1, 1], Huber loss, target network synced every 1,000 steps
+- FIRE is pressed at the start of the game and after every lost life; otherwise the ball is never launched
+
+## Results
+
+Trained for 120,000 steps (1,677 episodes) on CPU, then evaluated over 30 episodes (epsilon 0.05):
+
+| Policy | Mean score | Best | Worst |
+| --- | --- | --- | --- |
+| Random | 1.57 | 3 | 0 |
+| Trained DQN | 7.87 | 12 | 3 |
+
+The training curve rose from about 2 to about 7 over the run and was still trending up when it stopped, so longer
+runs should do better. The first version of this script (no input scaling, epsilon decaying to its floor within
+a few hundred steps, no warm-up, no FIRE handling) did not learn: its score fell from about 2.4 to 0 in 58 episodes.
 
 ## Notebook status
 
