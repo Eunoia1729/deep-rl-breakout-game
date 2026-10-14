@@ -1,0 +1,7 @@
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+# Trained models are large binaries; keep them out of git (share via releases or storage)
+models/*.keras
+!models/.gitkeep
